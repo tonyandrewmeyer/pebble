@@ -23,6 +23,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/canonical/pebble/internals/logger"
+	"github.com/canonical/pebble/internals/overlord/state"
 )
 
 var planLayer = `
@@ -202,4 +203,72 @@ func (s *apiSuite) TestLayersCombineFormatError(c *C) {
 	c.Assert(rsp.Type, Equals, ResponseTypeError)
 	result := rsp.Result.(*errorResult)
 	c.Assert(result.Message, Matches, `layer "base" must define "override" for service "dynamic"`)
+}
+
+func (s *apiSuite) TestGetPlanMasksEnvForNonAdmin(c *C) {
+	planLayerWithEnv := `
+services:
+    test-service:
+        override: replace
+        command: /bin/test
+        environment:
+            SECRET_KEY: super-secret-value
+            API_TOKEN: token-12345
+            PUBLIC_VAR: public-value
+checks:
+    test-check:
+        override: replace
+        level: alive
+        exec:
+            command: /bin/check
+            environment:
+                CHECK_SECRET: check-secret-value
+                CHECK_TOKEN: check-token-12345
+`
+	writeTestLayer(s.pebbleDir, planLayerWithEnv)
+	_ = s.daemon(c)
+	planCmd := apiCmd("/v1/plan")
+
+	// Test with admin user - should see actual values
+	adminUser := &UserState{
+		Access: state.AdminAccess,
+	}
+	req, err := http.NewRequest("GET", "/v1/plan?format=yaml", nil)
+	c.Assert(err, IsNil)
+	rsp := v1GetPlan(planCmd, req, adminUser).(*resp)
+	rec := httptest.NewRecorder()
+	rsp.ServeHTTP(rec, req)
+	c.Assert(rec.Code, Equals, 200)
+	c.Assert(rsp.Status, Equals, 200)
+	adminResult := rsp.Result.(string)
+	c.Assert(adminResult, Matches, `(?s).*SECRET_KEY: super-secret-value.*`)
+	c.Assert(adminResult, Matches, `(?s).*API_TOKEN: token-12345.*`)
+	c.Assert(adminResult, Matches, `(?s).*PUBLIC_VAR: public-value.*`)
+	c.Assert(adminResult, Matches, `(?s).*CHECK_SECRET: check-secret-value.*`)
+	c.Assert(adminResult, Matches, `(?s).*CHECK_TOKEN: check-token-12345.*`)
+
+	// Test with read user - should see masked values
+	readUser := &UserState{
+		Access: state.ReadAccess,
+	}
+	req, err = http.NewRequest("GET", "/v1/plan?format=yaml", nil)
+	c.Assert(err, IsNil)
+	rsp = v1GetPlan(planCmd, req, readUser).(*resp)
+	rec = httptest.NewRecorder()
+	rsp.ServeHTTP(rec, req)
+	c.Assert(rec.Code, Equals, 200)
+	c.Assert(rsp.Status, Equals, 200)
+	readResult := rsp.Result.(string)
+	// All environment values should be masked for non-admin users
+	c.Assert(readResult, Matches, `(?s).*SECRET_KEY: '\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*API_TOKEN: '\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*PUBLIC_VAR: '\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*CHECK_SECRET: '\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*CHECK_TOKEN: '\*\*\*'.*`)
+	// Should NOT contain actual values
+	c.Assert(readResult, Not(Matches), `(?s).*super-secret-value.*`)
+	c.Assert(readResult, Not(Matches), `(?s).*token-12345.*`)
+	c.Assert(readResult, Not(Matches), `(?s).*public-value.*`)
+	c.Assert(readResult, Not(Matches), `(?s).*check-secret-value.*`)
+	c.Assert(readResult, Not(Matches), `(?s).*check-token-12345.*`)
 }

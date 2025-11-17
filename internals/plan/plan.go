@@ -1683,3 +1683,49 @@ func copyIntPtr(p *int) *int {
 	copied := *p
 	return &copied
 }
+
+// CopyWithMaskedEnv returns a copy of the plan with all environment variable
+// values masked (replaced with "***"). This is useful for displaying plans to
+// non-admin users who should not see sensitive environment variable values.
+func (p *Plan) CopyWithMaskedEnv() *Plan {
+	masked := &Plan{
+		Layers:     p.Layers,
+		Services:   make(map[string]*Service),
+		Checks:     make(map[string]*Check),
+		LogTargets: make(map[string]*LogTarget),
+		Sections:   p.Sections,
+	}
+
+	// Copy services with masked environment variables
+	for name, service := range p.Services {
+		maskedService := service.Copy()
+		if maskedService.Environment != nil {
+			maskedEnv := make(map[string]string)
+			for k := range maskedService.Environment {
+				maskedEnv[k] = "***"
+			}
+			maskedService.Environment = maskedEnv
+		}
+		masked.Services[name] = maskedService
+	}
+
+	// Copy checks with masked environment variables
+	for name, check := range p.Checks {
+		maskedCheck := check.Copy()
+		if maskedCheck.Exec != nil && maskedCheck.Exec.Environment != nil {
+			maskedEnv := make(map[string]string)
+			for k := range maskedCheck.Exec.Environment {
+				maskedEnv[k] = "***"
+			}
+			maskedCheck.Exec.Environment = maskedEnv
+		}
+		masked.Checks[name] = maskedCheck
+	}
+
+	// Copy log targets as-is (no environment variables)
+	for name, target := range p.LogTargets {
+		masked.LogTargets[name] = target.Copy()
+	}
+
+	return masked
+}

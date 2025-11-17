@@ -2346,3 +2346,92 @@ func (s *S) TestReadLayersDir(c *C) {
 		}
 	}
 }
+
+func (s *S) TestCopyWithMaskedEnv(c *C) {
+	// Create a plan with environment variables in services and checks
+	planYAML := `
+		services:
+			svc1:
+				override: replace
+				command: /bin/svc1
+				environment:
+					SECRET_KEY: super-secret-value
+					API_TOKEN: token-12345
+					PUBLIC_VAR: public-value
+			svc2:
+				override: replace
+				command: /bin/svc2
+				environment:
+					DB_PASSWORD: db-secret-123
+		checks:
+			check1:
+				override: replace
+				level: alive
+				exec:
+					command: /bin/check1
+					environment:
+						CHECK_SECRET: check-secret-value
+						CHECK_TOKEN: check-token-12345
+			check2:
+				override: replace
+				level: ready
+				http:
+					url: http://localhost:8080/health
+		log-targets:
+			tgt1:
+				override: replace
+				type: loki
+				location: http://localhost:3100/loki/api/v1/push
+				services: [all]
+	`
+	layer, err := plan.ParseLayer(0, "test", reindent(planYAML))
+	c.Assert(err, IsNil)
+
+	combined, err := plan.CombineLayers(layer)
+	c.Assert(err, IsNil)
+
+	p := &plan.Plan{
+		Services:   combined.Services,
+		Checks:     combined.Checks,
+		LogTargets: combined.LogTargets,
+		Sections:   combined.Sections,
+	}
+
+	// Create masked copy
+	masked := p.CopyWithMaskedEnv()
+
+	// Verify services environment variables are masked
+	c.Assert(masked.Services["svc1"].Environment["SECRET_KEY"], Equals, "***")
+	c.Assert(masked.Services["svc1"].Environment["API_TOKEN"], Equals, "***")
+	c.Assert(masked.Services["svc1"].Environment["PUBLIC_VAR"], Equals, "***")
+	c.Assert(masked.Services["svc2"].Environment["DB_PASSWORD"], Equals, "***")
+
+	// Verify checks environment variables are masked
+	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_SECRET"], Equals, "***")
+	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_TOKEN"], Equals, "***")
+
+	// Verify check without exec environment is copied correctly
+	c.Assert(masked.Checks["check2"].HTTP, NotNil)
+	c.Assert(masked.Checks["check2"].HTTP.URL, Equals, "http://localhost:8080/health")
+
+	// Verify log targets are copied correctly
+	c.Assert(masked.LogTargets["tgt1"].Type, Equals, plan.LokiTarget)
+	c.Assert(masked.LogTargets["tgt1"].Location, Equals, "http://localhost:3100/loki/api/v1/push")
+
+	// Verify original plan is not modified
+	c.Assert(p.Services["svc1"].Environment["SECRET_KEY"], Equals, "super-secret-value")
+	c.Assert(p.Services["svc1"].Environment["API_TOKEN"], Equals, "token-12345")
+	c.Assert(p.Services["svc1"].Environment["PUBLIC_VAR"], Equals, "public-value")
+	c.Assert(p.Services["svc2"].Environment["DB_PASSWORD"], Equals, "db-secret-123")
+	c.Assert(p.Checks["check1"].Exec.Environment["CHECK_SECRET"], Equals, "check-secret-value")
+	c.Assert(p.Checks["check1"].Exec.Environment["CHECK_TOKEN"], Equals, "check-token-12345")
+
+	// Verify other service fields are copied correctly
+	c.Assert(masked.Services["svc1"].Command, Equals, "/bin/svc1")
+	c.Assert(masked.Services["svc2"].Command, Equals, "/bin/svc2")
+
+	// Verify other check fields are copied correctly
+	c.Assert(masked.Checks["check1"].Level, Equals, plan.AliveLevel)
+	c.Assert(masked.Checks["check1"].Exec.Command, Equals, "/bin/check1")
+	c.Assert(masked.Checks["check2"].Level, Equals, plan.ReadyLevel)
+}

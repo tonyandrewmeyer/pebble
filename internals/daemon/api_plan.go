@@ -22,10 +22,11 @@ import (
 
 	"github.com/canonical/pebble/internals/logger"
 	"github.com/canonical/pebble/internals/overlord/planstate"
+	"github.com/canonical/pebble/internals/overlord/state"
 	"github.com/canonical/pebble/internals/plan"
 )
 
-func v1GetPlan(c *Command, r *http.Request, _ *UserState) Response {
+func v1GetPlan(c *Command, r *http.Request, user *UserState) Response {
 	format := r.URL.Query().Get("format")
 	if format != "yaml" {
 		return BadRequest("invalid format %q", format)
@@ -33,6 +34,12 @@ func v1GetPlan(c *Command, r *http.Request, _ *UserState) Response {
 
 	planMgr := overlordPlanManager(c.d.overlord)
 	plan := planMgr.Plan()
+
+	// Mask environment variable values for non-admin users
+	if user != nil && user.Access != state.AdminAccess {
+		plan = plan.CopyWithMaskedEnv()
+	}
+
 	planYAML, err := yaml.Marshal(plan)
 	if err != nil {
 		return InternalError("cannot serialize plan: %v", err)
