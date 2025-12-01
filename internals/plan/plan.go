@@ -1685,7 +1685,7 @@ func copyIntPtr(p *int) *int {
 }
 
 // CopyWithMaskedEnv returns a copy of the plan with all environment variable
-// values masked (replaced with "***"). This is useful for displaying plans to
+// values masked (replaced with "*****"). This is useful for displaying plans to
 // non-admin users who should not see sensitive environment variable values.
 func (p *Plan) CopyWithMaskedEnv() *Plan {
 	masked := &Plan{
@@ -1702,7 +1702,7 @@ func (p *Plan) CopyWithMaskedEnv() *Plan {
 		if maskedService.Environment != nil {
 			maskedEnv := make(map[string]string)
 			for k := range maskedService.Environment {
-				maskedEnv[k] = "***"
+				maskedEnv[k] = "*****"
 			}
 			maskedService.Environment = maskedEnv
 		}
@@ -1715,7 +1715,7 @@ func (p *Plan) CopyWithMaskedEnv() *Plan {
 		if maskedCheck.Exec != nil && maskedCheck.Exec.Environment != nil {
 			maskedEnv := make(map[string]string)
 			for k := range maskedCheck.Exec.Environment {
-				maskedEnv[k] = "***"
+				maskedEnv[k] = "*****"
 			}
 			maskedCheck.Exec.Environment = maskedEnv
 		}

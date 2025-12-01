@@ -260,11 +260,11 @@ checks:
 	c.Assert(rsp.Status, Equals, 200)
 	readResult := rsp.Result.(string)
 	// All environment values should be masked for non-admin users
-	c.Assert(readResult, Matches, `(?s).*SECRET_KEY: '\*\*\*'.*`)
-	c.Assert(readResult, Matches, `(?s).*API_TOKEN: '\*\*\*'.*`)
-	c.Assert(readResult, Matches, `(?s).*PUBLIC_VAR: '\*\*\*'.*`)
-	c.Assert(readResult, Matches, `(?s).*CHECK_SECRET: '\*\*\*'.*`)
-	c.Assert(readResult, Matches, `(?s).*CHECK_TOKEN: '\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*SECRET_KEY: '\*\*\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*API_TOKEN: '\*\*\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*PUBLIC_VAR: '\*\*\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*CHECK_SECRET: '\*\*\*\*\*'.*`)
+	c.Assert(readResult, Matches, `(?s).*CHECK_TOKEN: '\*\*\*\*\*'.*`)
 	// Should NOT contain actual values
 	c.Assert(readResult, Not(Matches), `(?s).*super-secret-value.*`)
 	c.Assert(readResult, Not(Matches), `(?s).*token-12345.*`)

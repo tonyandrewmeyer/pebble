@@ -2401,14 +2401,14 @@ func (s *S) TestCopyWithMaskedEnv(c *C) {
 	masked := p.CopyWithMaskedEnv()
 
 	// Verify services environment variables are masked
-	c.Assert(masked.Services["svc1"].Environment["SECRET_KEY"], Equals, "***")
-	c.Assert(masked.Services["svc1"].Environment["API_TOKEN"], Equals, "***")
-	c.Assert(masked.Services["svc1"].Environment["PUBLIC_VAR"], Equals, "***")
-	c.Assert(masked.Services["svc2"].Environment["DB_PASSWORD"], Equals, "***")
+	c.Assert(masked.Services["svc1"].Environment["SECRET_KEY"], Equals, "*****")
+	c.Assert(masked.Services["svc1"].Environment["API_TOKEN"], Equals, "*****")
+	c.Assert(masked.Services["svc1"].Environment["PUBLIC_VAR"], Equals, "*****")
+	c.Assert(masked.Services["svc2"].Environment["DB_PASSWORD"], Equals, "*****")
 
 	// Verify checks environment variables are masked
-	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_SECRET"], Equals, "***")
-	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_TOKEN"], Equals, "***")
+	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_SECRET"], Equals, "*****")
+	c.Assert(masked.Checks["check1"].Exec.Environment["CHECK_TOKEN"], Equals, "*****")
 
 	// Verify check without exec environment is copied correctly
 	c.Assert(masked.Checks["check2"].HTTP, NotNil)
