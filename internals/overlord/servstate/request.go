@@ -159,40 +159,6 @@ func createMonitorOnlyRunServiceChange(st *state.State, serviceName string, conf
 	return change.ID()
 }
 
-// createRunServiceChange creates a long-running change to represent a service being run.
-// The change contains start-service and monitor-service tasks.
-// The service config will be cached by the start-service handler.
-func createRunServiceChange(st *state.State, serviceName string) (changeID string) {
-	summary := fmt.Sprintf("Run service %q", serviceName)
-
-	// Create start-service task
-	startTask := st.NewTask(startServiceKind, fmt.Sprintf("Start service %q", serviceName))
-	startTask.Set("start-details", &startServiceDetails{
-		ServiceName: serviceName,
-	})
-
-	// Create monitor-service task (depends on start completing)
-	monitorTask := st.NewTask(monitorServiceKind, fmt.Sprintf("Monitor service %q", serviceName))
-	monitorTask.Set("monitor-details", &monitorServiceDetails{
-		ServiceName: serviceName,
-		StartTime:   time.Now(),
-	})
-	monitorTask.WaitFor(startTask)
-
-	// Create the run-service change
-	change := st.NewChangeWithNoticeData(runServiceKind, summary, map[string]string{
-		"service-name": serviceName,
-	})
-	change.Set(serviceNoPruneAttr, true) // Don't prune long-running changes
-	change.Set("run-service-details", &runServiceDetails{
-		ServiceName: serviceName,
-	})
-	change.AddTask(startTask)
-	change.AddTask(monitorTask)
-
-	return change.ID()
-}
-
 // createRestartServiceChange creates a change to handle service restart with exponential backoff.
 func createRestartServiceChange(st *state.State, serviceName string, config *plan.Service, exitCode int, initialAttempts int) (changeID string) {
 	summary := fmt.Sprintf("Restart service %q", serviceName)
