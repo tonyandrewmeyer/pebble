@@ -110,6 +110,14 @@ type serviceData struct {
 	restarting   bool
 	currentSince time.Time
 	startCount   atomic.Int64
+
+	// Exit notification for monitor-service task
+	exitNotify chan exitInfo
+	// ID of current run-service change (for tracking)
+	runChangeID string
+	// Last exit information (for when monitor task isn't running)
+	lastExitCode   int
+	lastExitAction plan.ServiceAction
 }
 
 func (m *ServiceManager) doStart(task *state.Task, tomb *tomb.Tomb) error {
@@ -173,6 +181,20 @@ func (m *ServiceManager) doStart(task *state.Task, tomb *tomb.Tomb) error {
 			return fmt.Errorf("service start attempt: %w", err)
 		}
 		// Started successfully (ran for small amount of time without exiting).
+		// Create a run-service change with a monitor task for lifecycle visibility.
+		m.state.Lock()
+		changeID := createMonitorOnlyRunServiceChange(m.state, request.Name, config)
+		m.state.EnsureBefore(0)
+		m.state.Unlock()
+
+		m.servicesLock.Lock()
+		service.runChangeID = changeID
+		m.servicesLock.Unlock()
+
+		// Trigger the runner to pick up the new change
+		m.runner.Ensure()
+
+		logger.Debugf("Created run-service change %s for service %q", changeID, request.Name)
 		return nil
 	case <-tomb.Dying():
 		// User tried to abort the start, sending SIGKILL to process is about
@@ -262,7 +284,8 @@ func (m *ServiceManager) doStop(task *state.Task, tomb *tomb.Tomb) error {
 	}
 
 	// Stop service: send SIGTERM, and if that doesn't stop the process in a
-	// short time, send SIGKILL.
+	// short time, send SIGKILL. The exited() handler will notify the monitor
+	// task (if any) which will cause the run-service change to complete.
 	err = service.stop()
 	if err != nil {
 		return err
@@ -542,15 +565,63 @@ func (s *serviceData) exited(exitCode int) error {
 		s.resetTimer.Stop()
 	}
 
+	// Determine the action that would be taken based on exit code
+	var action plan.ServiceAction
+	if s.restarting {
+		action = plan.ActionRestart
+	} else {
+		action, _ = getAction(s.config, exitCode == 0)
+	}
+
+	// Always store the last exit info on the service for handleRunServiceComplete
+	s.lastExitCode = exitCode
+	s.lastExitAction = action
+
+	// Notify monitor-service task if it's active (for run-service changes)
+	// Notify for all exits when exitNotify is set, including manual stops.
+	// For manual stops, use ActionIgnore so no restart is created.
+	if s.exitNotify != nil {
+		notifyAction := action
+		// For manual stop (terminating/killing without restarting), use ignore action
+		if (s.state == stateTerminating || s.state == stateKilling) && !s.restarting {
+			notifyAction = plan.ActionIgnore
+		}
+		select {
+		case s.exitNotify <- exitInfo{Code: exitCode, Action: string(notifyAction)}:
+			logger.Debugf("Sent exit notification for service %q (code %d, action %s)",
+				s.config.Name, exitCode, notifyAction)
+		default:
+			// Channel might be closed or not ready
+			logger.Debugf("Could not send exit notification for service %q", s.config.Name)
+		}
+	}
+
 	switch s.state {
 	case stateStarting:
-		// Send error to select waiting in doStart, then fall through to perform action.
+		// Send error to select waiting in doStart/doStartService
 		action, _ := getAction(s.config, exitCode == 0)
 		s.started <- fmt.Errorf("exited quickly with code %d, will %s", exitCode, action)
+		// If there's a monitor task, it will handle the restart via changes
+		// If not (old doStart), fall through to old behavior
+		if s.exitNotify != nil {
+			// New change-based model: just transition state, monitor will handle the rest
+			// For shutdown actions, always use stateExited (StatusError)
+			s.transition(exitedState(exitCode, action))
+			return nil
+		}
 		fallthrough
 
 	case stateRunning:
 		logger.Noticef("Service %q stopped unexpectedly with code %d", s.config.Name, exitCode)
+
+		// If we have a monitor task, it handles the exit via changeStatusChanged
+		if s.exitNotify != nil {
+			// Transition to appropriate state based on exit code and action
+			s.transition(exitedState(exitCode, action))
+			return nil
+		}
+
+		// Old behavior (no monitor task): handle locally
 		action, onType := getAction(s.config, exitCode == 0)
 		switch action {
 		case plan.ActionIgnore:
@@ -592,6 +663,25 @@ func (s *serviceData) exited(exitCode int) error {
 		}
 
 	case stateTerminating, stateKilling:
+		// If we have a monitor task, it handles the exit via changeStatusChanged
+		if s.exitNotify != nil {
+			if s.restarting {
+				logger.Noticef("Service %q exited after check failure, will restart via change",
+					s.config.Name)
+				s.transition(stateExited)
+			} else {
+				logger.Noticef("Service %q stopped (via change)", s.config.Name)
+				s.transition(stateStopped)
+			}
+			// Also signal doStop that we're done
+			select {
+			case s.stopped <- nil:
+			default:
+			}
+			return nil
+		}
+
+		// Old behavior (no monitor task)
 		if s.restarting {
 			logger.Noticef("Service %q exited after check failure, restarting", s.config.Name)
 			s.doBackoff(plan.ActionRestart, "on-check-failure")
@@ -678,6 +768,21 @@ func getAction(config *plan.Service, success bool) (action plan.ServiceAction, o
 		action = plan.ActionRestart // default for "on-success" and "on-failure"
 	}
 	return action, onType
+}
+
+// exitedState returns the appropriate service state after exit based on
+// exit code and action. Shutdown actions always result in stateExited
+// (StatusError), regardless of exit code.
+func exitedState(exitCode int, action plan.ServiceAction) serviceState {
+	switch action {
+	case plan.ActionShutdown, plan.ActionSuccessShutdown, plan.ActionFailureShutdown:
+		return stateExited
+	default:
+		if exitCode == 0 {
+			return stateStopped
+		}
+		return stateExited
+	}
 }
 
 // sendSignal sends the given signal to a running service. Note that this
@@ -917,4 +1022,257 @@ func (d *serviceData) writeMetric(writer metrics.Writer) error {
 
 var setCmdCredential = func(cmd *exec.Cmd, credential *syscall.Credential) {
 	cmd.SysProcAttr.Credential = credential
+}
+
+// doMonitorService blocks until the service exits, then completes the task.
+// This allows the run-service change to remain active while the service is running.
+func (m *ServiceManager) doMonitorService(task *state.Task, tomb *tomb.Tomb) error {
+	m.state.Lock()
+	var details monitorServiceDetails
+	err := task.Get("monitor-details", &details)
+	m.state.Unlock()
+	if err != nil {
+		return fmt.Errorf("cannot get monitor details: %v", err)
+	}
+
+	logger.Debugf("Monitoring service %q", details.ServiceName)
+
+	// Get the service
+	m.servicesLock.Lock()
+	service := m.services[details.ServiceName]
+	if service == nil {
+		m.servicesLock.Unlock()
+		return fmt.Errorf("service %q not found", details.ServiceName)
+	}
+
+	// Create exit notification channel
+	exitChan := make(chan exitInfo, 1)
+	service.exitNotify = exitChan
+	m.servicesLock.Unlock()
+
+	// Block until service exits or task is aborted
+	select {
+	case exitData := <-exitChan:
+		// Service exited, store exit information in task
+		logger.Debugf("Service %q exited with code %d, action %q",
+			details.ServiceName, exitData.Code, exitData.Action)
+
+		m.state.Lock()
+		task.Set("exit-code", exitData.Code)
+		task.Set("exit-action", exitData.Action)
+		m.state.Unlock()
+
+		// Return error if exit code is non-zero
+		if exitData.Code != 0 {
+			return fmt.Errorf("service exited with code %d", exitData.Code)
+		}
+		return nil
+
+	case <-tomb.Dying():
+		// Task aborted (e.g., user stopped service manually)
+		logger.Debugf("Monitor task for service %q aborted", details.ServiceName)
+
+		// Clear the exit notification channel
+		m.servicesLock.Lock()
+		if service.exitNotify == exitChan {
+			service.exitNotify = nil
+		}
+		m.servicesLock.Unlock()
+
+		return fmt.Errorf("monitoring aborted")
+	}
+}
+
+// doStartService starts a service. This is similar to doStart but designed
+// to work with the run-service change model.
+func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error {
+	m.state.Lock()
+	var details startServiceDetails
+	err := task.Get("start-details", &details)
+	m.state.Unlock()
+	if err != nil {
+		return fmt.Errorf("cannot get start details: %v", err)
+	}
+
+	currentPlan := m.getPlan()
+	config, ok := currentPlan.Services[details.ServiceName]
+	if !ok {
+		return fmt.Errorf("cannot find service %q in plan", details.ServiceName)
+	}
+
+	var workload *workloads.Workload
+	if config.Workload != "" {
+		ws := currentPlan.Sections[workloads.WorkloadsField].(*workloads.WorkloadsSection)
+		if workload = ws.Entries[config.Workload]; workload == nil {
+			return fmt.Errorf("internal error: cannot find workload %q for service %q in plan", config.Workload, details.ServiceName)
+		}
+	}
+
+	// Create or get the service object
+	service, taskLog := m.serviceForStart(config, workload)
+	if taskLog != "" {
+		addTaskLog(task, taskLog)
+	}
+	if service == nil {
+		return nil
+	}
+
+	// Cache the service config for use by handleRunServiceComplete
+	m.state.Lock()
+	changeID := task.Change().ID()
+	m.state.Cache(runServiceConfigKey{changeID}, config)
+	m.state.Unlock()
+
+	// Store the run-service change ID in the service
+	m.servicesLock.Lock()
+	service.runChangeID = changeID
+	m.servicesLock.Unlock()
+
+	// Start the service and transition to stateStarting
+	err = service.start()
+	if err != nil {
+		return err
+	}
+
+	// Wait for a small amount of time, and if the service hasn't exited,
+	// consider it a success.
+	select {
+	case err := <-service.started:
+		if err != nil {
+			addLastLogs(task, service.logs)
+			return fmt.Errorf("service start attempt: %w", err)
+		}
+		// Started successfully
+		return nil
+	case <-tomb.Dying():
+		// Task aborted
+		m.servicesLock.Lock()
+		defer m.servicesLock.Unlock()
+		service.transition(stateStopped)
+		err := syscall.Kill(-service.cmd.Process.Pid, syscall.SIGKILL)
+		if err != nil {
+			return fmt.Errorf("start aborted, but cannot send SIGKILL to process: %v", err)
+		}
+		return fmt.Errorf("start aborted, sent SIGKILL to process")
+	}
+}
+
+// doRestartService handles restarting a service with exponential backoff.
+// It will keep attempting to restart the service until it successfully runs.
+func (m *ServiceManager) doRestartService(task *state.Task, tomb *tomb.Tomb) error {
+	m.state.Lock()
+	changeID := task.Change().ID()
+	var details restartServiceDetails
+	err := task.Get("restart-details", &details)
+	config := m.state.Cached(restartServiceConfigKey{changeID}).(*plan.Service)
+	m.state.Unlock()
+	if err != nil {
+		return fmt.Errorf("cannot get restart details: %v", err)
+	}
+
+	logger.Debugf("Restarting service %q (exited with code %d)", details.ServiceName, details.InitialExitCode)
+
+	// Get or create the service object
+	m.servicesLock.Lock()
+	service := m.services[details.ServiceName]
+	if service == nil {
+		// Create new service object for restart
+		service = &serviceData{
+			manager: m,
+			state:   stateInitial,
+			logs:    servicelog.NewRingBuffer(maxLogBytes),
+			started: make(chan error, 1),
+			stopped: make(chan error, 2),
+		}
+		service.config = config.Copy()
+		m.services[details.ServiceName] = service
+	} else {
+		// Ensure config is up-to-date
+		service.config = config.Copy()
+	}
+	m.servicesLock.Unlock()
+
+	// Restart loop with exponential backoff
+	for {
+		// Calculate backoff delay for this attempt
+		backoffTime := calculateNextBackoff(config, time.Duration(details.Attempts)*config.BackoffDelay.Value)
+
+		// Always wait for backoff (even on first attempt) - this matches old doBackoff behavior
+		duration := backoffTime + m.getJitter(backoffTime)
+		logger.Noticef("Service %q waiting ~%s before restart attempt %d",
+			details.ServiceName, duration, details.Attempts+1)
+
+		select {
+		case <-time.After(duration):
+			// Continue with restart attempt
+		case <-tomb.Dying():
+			return fmt.Errorf("restart aborted")
+		}
+
+		// Increment attempt counter and update task (triggers change-update notice)
+		details.Attempts++
+		m.state.Lock()
+		task.Set("restart-details", &details)
+		task.Logf("Restart attempt %d", details.Attempts)
+		m.state.Unlock()
+
+		// Also update the service object's backoffNum for backward compatibility
+		m.servicesLock.Lock()
+		service.backoffNum = details.Attempts
+		service.backoffTime = calculateNextBackoff(config, time.Duration(details.Attempts-1)*config.BackoffDelay.Value)
+		m.servicesLock.Unlock()
+
+		// Attempt to start the service
+		m.servicesLock.Lock()
+		if service.state != stateInitial {
+			service.transition(stateInitial)
+		}
+		err = service.startInternal()
+		if err != nil {
+			service.transition(stateStopped)
+			m.servicesLock.Unlock()
+			logger.Noticef("Service %q restart attempt %d failed to start: %v",
+				details.ServiceName, details.Attempts, err)
+			continue // Try again
+		}
+		service.transition(stateStarting)
+		// Set up okayDelay timer to signal when service is considered running
+		time.AfterFunc(okayDelay, func() { logError(service.okayWaitElapsed()) })
+		m.servicesLock.Unlock()
+
+		logger.Noticef("Service %q restart attempt %d started (PID %d)",
+			details.ServiceName, details.Attempts, service.cmd.Process.Pid)
+
+		// Wait for okayDelay to ensure service stays running
+		select {
+		case err := <-service.started:
+			if err != nil {
+				// Service exited during startup period
+				logger.Noticef("Service %q restart attempt %d exited quickly: %v",
+					details.ServiceName, details.Attempts, err)
+				continue // Try again
+			}
+
+			// Service stayed running for okayDelay - success!
+			m.servicesLock.Lock()
+			service.transition(stateRunning)
+			// Set up timer to reset backoff if service continues running
+			if service.resetTimer != nil {
+				service.resetTimer.Stop()
+			}
+			service.resetTimer = time.AfterFunc(config.BackoffLimit.Value, func() { logError(service.backoffResetElapsed()) })
+			m.servicesLock.Unlock()
+
+			logger.Noticef("Service %q successfully restarted after %d attempts",
+				details.ServiceName, details.Attempts)
+			return nil
+
+		case <-tomb.Dying():
+			// Restart aborted
+			m.servicesLock.Lock()
+			service.transition(stateStopped)
+			m.servicesLock.Unlock()
+			return fmt.Errorf("restart aborted")
+		}
+	}
 }

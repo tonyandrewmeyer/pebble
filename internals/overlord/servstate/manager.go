@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/canonical/pebble/internals/logger"
 	"github.com/canonical/pebble/internals/metrics"
 	"github.com/canonical/pebble/internals/overlord/restart"
 	"github.com/canonical/pebble/internals/overlord/state"
@@ -22,7 +23,8 @@ import (
 var timeNow = time.Now
 
 type ServiceManager struct {
-	state *state.State
+	state  *state.State
+	runner *state.TaskRunner
 
 	planLock sync.Mutex
 	plan     *plan.Plan
@@ -50,6 +52,7 @@ type Restarter interface {
 func NewManager(s *state.State, runner *state.TaskRunner, serviceOutput io.Writer, restarter Restarter, logMgr LogManager) (*ServiceManager, error) {
 	manager := &ServiceManager{
 		state:         s,
+		runner:        runner,
 		services:      make(map[string]*serviceData),
 		serviceOutput: serviceOutput,
 		restarter:     restarter,
@@ -57,8 +60,19 @@ func NewManager(s *state.State, runner *state.TaskRunner, serviceOutput io.Write
 		logMgr:        logMgr,
 	}
 
+	// Old-style handlers (still needed for backward compatibility)
 	runner.AddHandler("start", manager.doStart, nil)
 	runner.AddHandler("stop", manager.doStop, nil)
+
+	// New change-based handlers
+	runner.AddHandler(startServiceKind, manager.doStartService, nil)
+	runner.AddHandler(monitorServiceKind, manager.doMonitorService, nil)
+	runner.AddHandler(restartServiceKind, manager.doRestartService, nil)
+
+	// Register change status change callback
+	s.Lock()
+	s.AddChangeStatusChangedHandler(manager.changeStatusChanged)
+	s.Unlock()
 
 	return manager, nil
 }
@@ -446,4 +460,175 @@ func servicesToStop(m *ServiceManager) ([][]string, error) {
 		}
 	}
 	return result, nil
+}
+
+// changeStatusChanged handles state transitions for run-service and restart-service changes.
+// This coordinates the lifecycle: run-service → (exit) → restart-service → (success) → run-service
+// Note: This callback is invoked while the state lock is held, so we spawn goroutines to avoid deadlock.
+func (m *ServiceManager) changeStatusChanged(change *state.Change, old, new state.Status) {
+	switch change.Kind() {
+	case runServiceKind:
+		if new == state.DoneStatus || new == state.ErrorStatus {
+			// Service exited, handle based on configured action
+			// Spawn goroutine to avoid deadlock (callback is called with state lock held)
+			go m.handleRunServiceComplete(change)
+		}
+
+	case restartServiceKind:
+		if new == state.DoneStatus {
+			// Restart successful, create new run-service change
+			// Spawn goroutine to avoid deadlock (callback is called with state lock held)
+			go m.handleRestartServiceComplete(change)
+		}
+	}
+}
+
+// handleRunServiceComplete is called when a run-service change completes.
+// It checks the exit action and creates a restart-service change if needed.
+func (m *ServiceManager) handleRunServiceComplete(change *state.Change) {
+	// Get change data with state lock
+	m.state.Lock()
+	var details runServiceDetails
+	err := change.Get("run-service-details", &details)
+	m.state.Unlock()
+
+	if err != nil {
+		logger.Noticef("Cannot get run-service details: %v", err)
+		return
+	}
+
+	serviceName := details.ServiceName
+
+	m.servicesLock.Lock()
+	service := m.services[serviceName]
+	m.servicesLock.Unlock()
+
+	if service == nil {
+		logger.Noticef("Service %q not found when handling run-service completion", serviceName)
+		return
+	}
+
+	// Get exit information. First try the monitor-service task, then fall back
+	// to the service's last exit info (for when service exits before monitor starts).
+	var exitCode int
+	var action plan.ServiceAction
+	gotExitInfo := false
+
+	m.state.Lock()
+	tasks := change.Tasks()
+	for _, t := range tasks {
+		if t.Kind() == monitorServiceKind {
+			var code int
+			var actionStr string
+			err1 := t.Get("exit-code", &code)
+			err2 := t.Get("exit-action", &actionStr)
+			if err1 == nil && err2 == nil {
+				exitCode = code
+				action = plan.ServiceAction(actionStr)
+				gotExitInfo = true
+			}
+			break
+		}
+	}
+	m.state.Unlock()
+
+	if !gotExitInfo {
+		// Fall back to the service's last exit info
+		m.servicesLock.Lock()
+		exitCode = service.lastExitCode
+		action = service.lastExitAction
+		m.servicesLock.Unlock()
+		logger.Debugf("Using service's last exit info for %q: code=%d, action=%s",
+			serviceName, exitCode, action)
+	}
+
+	// Based on action, decide what to do
+	switch action {
+	case plan.ActionIgnore:
+		// Do nothing, service stays exited
+		logger.Noticef("Service %q exited with code %d, action is ignore", serviceName, exitCode)
+
+	case plan.ActionRestart:
+		// Create restart-service change
+		logger.Noticef("Service %q exited with code %d, creating restart change", serviceName, exitCode)
+
+		m.state.Lock()
+		// Get current backoff number from service for continuity and
+		// transition service state to backoff for backward compatibility
+		m.servicesLock.Lock()
+		initialAttempts := service.backoffNum
+		// Transition service to backoff state so status queries show StatusBackoff
+		service.backoffNum++
+		service.backoffTime = calculateNextBackoff(service.config, service.backoffTime)
+		service.transition(stateBackoff)
+		m.servicesLock.Unlock()
+
+		config := m.state.Cached(runServiceConfigKey{change.ID()}).(*plan.Service)
+		createRestartServiceChange(m.state, serviceName, config, exitCode, initialAttempts)
+		m.state.EnsureBefore(0)
+		m.state.Unlock()
+
+		m.runner.Ensure()
+
+	case plan.ActionShutdown, plan.ActionSuccessShutdown, plan.ActionFailureShutdown:
+		// Trigger system shutdown
+		logger.Noticef("Service %q exited, triggering shutdown (action: %s)", serviceName, action)
+
+		var restartType restart.RestartType
+		switch action {
+		case plan.ActionShutdown:
+			if exitCode != 0 {
+				restartType = restart.RestartServiceFailure
+			} else {
+				restartType = restart.RestartDaemon
+			}
+		case plan.ActionSuccessShutdown:
+			restartType = restart.RestartDaemon
+		case plan.ActionFailureShutdown:
+			restartType = restart.RestartServiceFailure
+		}
+		m.restarter.HandleRestart(restartType)
+	}
+}
+
+// handleRestartServiceComplete is called when a restart-service change completes successfully.
+// It creates a new run-service change to continue monitoring the service.
+func (m *ServiceManager) handleRestartServiceComplete(change *state.Change) {
+	m.state.Lock()
+
+	tasks := change.Tasks()
+	if len(tasks) == 0 {
+		m.state.Unlock()
+		logger.Noticef("restart-service change %s has no tasks", change.ID())
+		return
+	}
+
+	var details restartServiceDetails
+	err := tasks[0].Get("restart-details", &details)
+	if err != nil {
+		m.state.Unlock()
+		logger.Noticef("Cannot get restart details: %v", err)
+		return
+	}
+
+	serviceName := details.ServiceName
+
+	// Get the service config from the restart-service change cache
+	config := m.state.Cached(restartServiceConfigKey{change.ID()}).(*plan.Service)
+
+	logger.Noticef("Service %q restarted successfully, creating new run-service change", serviceName)
+
+	// Use monitor-only change since the service is already running
+	changeID := createMonitorOnlyRunServiceChange(m.state, serviceName, config)
+	m.state.EnsureBefore(0)
+	m.state.Unlock()
+
+	// Update the service's run change ID
+	m.servicesLock.Lock()
+	if service := m.services[serviceName]; service != nil {
+		service.runChangeID = changeID
+	}
+	m.servicesLock.Unlock()
+
+	m.runner.Ensure()
 }
