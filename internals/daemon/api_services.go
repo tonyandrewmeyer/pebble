@@ -107,39 +107,14 @@ func v1PostServices(c *Command, r *http.Request, _ *UserState) Response {
 	var lanes [][]string
 	var services []string
 	switch payload.Action {
-	case "autostart":
-		// For autostart, use run-service changes for full lifecycle visibility.
-		// Each service gets its own long-running run-service change.
+	case "autostart", "start":
+		// Each service gets a run-service change created after successful
+		// start for lifecycle visibility and restart handling.
 		lanes, err = servmgr.StartOrder(payload.Services)
 		if err != nil {
 			break
 		}
-		plan := c.d.overlord.PlanManager().Plan()
-		var changeIDs []string
-		changeIDs, err = servstate.StartServices(st, plan, lanes)
-		if err != nil {
-			break
-		}
-		// Create a "wait" task for the wrapper change that waits for all
-		// start-service tasks in the run-service changes to complete.
-		// This allows the caller to wait for services to start without
-		// waiting for them to exit.
-		waitTask := st.NewTask("autostart-wait", "Wait for services to start")
-		for _, changeID := range changeIDs {
-			change := st.Change(changeID)
-			for _, task := range change.Tasks() {
-				if task.Kind() == "start-service" {
-					waitTask.WaitFor(task)
-				}
-			}
-		}
-		taskSet = state.NewTaskSet(waitTask)
-	case "start":
-		lanes, err = servmgr.StartOrder(payload.Services)
-		if err != nil {
-			break
-		}
-		taskSet, err = servstate.Start(st, lanes)
+		taskSet, err = createStartTaskSet(st, lanes, nil)
 	case "stop":
 		lanes, err = servmgr.StopOrder(payload.Services)
 		if err != nil {
@@ -161,15 +136,14 @@ func v1PostServices(c *Command, r *http.Request, _ *UserState) Response {
 		if err != nil {
 			break
 		}
-		var startTasks *state.TaskSet
-		startTasks, err = servstate.Start(st, lanes)
+		var startTaskSet *state.TaskSet
+		startTaskSet, err = createStartTaskSet(st, lanes, stopTasks)
 		if err != nil {
 			break
 		}
-		startTasks.WaitAll(stopTasks)
 		taskSet = state.NewTaskSet()
 		taskSet.AddAll(stopTasks)
-		taskSet.AddAll(startTasks)
+		taskSet.AddAll(startTaskSet)
 	case "replan":
 		var stopLanes, startLanes [][]string
 		stopLanes, startLanes, err = servmgr.Replan()
@@ -181,15 +155,14 @@ func v1PostServices(c *Command, r *http.Request, _ *UserState) Response {
 		if err != nil {
 			break
 		}
-		var startTasks *state.TaskSet
-		startTasks, err = servstate.Start(st, startLanes)
+		var startTaskSet *state.TaskSet
+		startTaskSet, err = createStartTaskSet(st, startLanes, stopTasks)
 		if err != nil {
 			break
 		}
-		startTasks.WaitAll(stopTasks)
 		taskSet = state.NewTaskSet()
 		taskSet.AddAll(stopTasks)
-		taskSet.AddAll(startTasks)
+		taskSet.AddAll(startTaskSet)
 
 		// Populate a list of services affected by the replan for summary.
 		replanned := make(map[string]bool)
@@ -266,6 +239,50 @@ func v1GetService(c *Command, r *http.Request, _ *UserState) Response {
 
 func v1PostService(c *Command, r *http.Request, _ *UserState) Response {
 	return BadRequest("not implemented")
+}
+
+// createStartTaskSet creates start-service tasks for the given services and returns
+// a TaskSet. If waitFor is provided, the start-service tasks will wait for those
+// tasks first. Each service gets a run-service change created by doStartService
+// after successful start for lifecycle tracking.
+func createStartTaskSet(st *state.State, lanes [][]string, waitFor *state.TaskSet) (*state.TaskSet, error) {
+	var tasks []*state.Task
+	var prevLaneTasks []*state.Task
+
+	for _, services := range lanes {
+		lane := st.NewLane()
+		var currentLaneTasks []*state.Task
+		for i, name := range services {
+			task := st.NewTask("start-service", fmt.Sprintf("Start service %q", name))
+			task.Set("start-details", &servstate.StartServiceDetails{
+				ServiceName: name,
+			})
+			task.JoinLane(lane)
+
+			// Wait for prerequisite tasks (e.g., stop tasks in restart)
+			if waitFor != nil {
+				for _, waitTask := range waitFor.Tasks() {
+					task.WaitFor(waitTask)
+				}
+			}
+
+			// Wait for tasks in previous lane
+			for _, prevTask := range prevLaneTasks {
+				task.WaitFor(prevTask)
+			}
+
+			// Wait for previous task in the same lane
+			if i > 0 {
+				task.WaitFor(tasks[len(tasks)-1])
+			}
+
+			tasks = append(tasks, task)
+			currentLaneTasks = append(currentLaneTasks, task)
+		}
+		prevLaneTasks = currentLaneTasks
+	}
+
+	return state.NewTaskSet(tasks...), nil
 }
 
 // intersectOrdered returns the intersection of left and right where

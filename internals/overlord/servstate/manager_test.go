@@ -322,8 +322,7 @@ services:
 
 	// Start the service without waiting for change ready.
 	s.st.Lock()
-	ts, err := servstate.Start(s.st, [][]string{{serviceName}})
-	c.Check(err, IsNil)
+	ts := s.createStartTasks([][]string{{serviceName}})
 	chgStart := s.st.NewChange("test", "Start test")
 	chgStart.AddAll(ts)
 	s.st.Unlock()
@@ -2100,13 +2099,47 @@ func (s *S) testServiceLogs(c *C, outputs map[string]string) {
 
 func (s *S) startServices(c *C, lanes [][]string) *state.Change {
 	s.st.Lock()
-	ts, err := servstate.Start(s.st, lanes)
-	c.Check(err, IsNil)
+	ts := s.createStartTasks(lanes)
 	chg := s.st.NewChange("test", "Start test")
 	chg.AddAll(ts)
 	s.st.Unlock()
 	waitChangeReady(c, s.runner, chg, "services to start")
 	return chg
+}
+
+// createStartTasks creates start-service tasks for the given services.
+// The state must be locked when calling this function.
+func (s *S) createStartTasks(lanes [][]string) *state.TaskSet {
+	var tasks []*state.Task
+	var prevLaneTasks []*state.Task
+
+	for _, services := range lanes {
+		lane := s.st.NewLane()
+		var currentLaneTasks []*state.Task
+		for i, name := range services {
+			task := s.st.NewTask("start-service", fmt.Sprintf("Start service %q", name))
+			task.Set("start-details", &servstate.StartServiceDetails{
+				ServiceName: name,
+			})
+			task.JoinLane(lane)
+
+			// Wait for tasks in previous lane
+			for _, prevTask := range prevLaneTasks {
+				task.WaitFor(prevTask)
+			}
+
+			// Wait for previous task in the same lane
+			if i > 0 {
+				task.WaitFor(tasks[len(tasks)-1])
+			}
+
+			tasks = append(tasks, task)
+			currentLaneTasks = append(currentLaneTasks, task)
+		}
+		prevLaneTasks = currentLaneTasks
+	}
+
+	return state.NewTaskSet(tasks...)
 }
 
 func (s *S) stopServices(c *C, lanes [][]string) *state.Change {

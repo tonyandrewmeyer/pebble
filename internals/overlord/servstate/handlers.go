@@ -120,96 +120,6 @@ type serviceData struct {
 	lastExitAction plan.ServiceAction
 }
 
-func (m *ServiceManager) doStart(task *state.Task, tomb *tomb.Tomb) error {
-	// Don't restart services that were left in DoingStatus when the daemon terminated.
-	m.state.Lock()
-	var started bool
-	task.Get("started", &started)
-	m.state.Unlock()
-	if started {
-		return fmt.Errorf("service already started, not retrying")
-	}
-
-	m.state.Lock()
-	request, err := TaskServiceRequest(task)
-	m.state.Unlock()
-	if err != nil {
-		return err
-	}
-
-	currentPlan := m.getPlan()
-	config, ok := currentPlan.Services[request.Name]
-	if !ok {
-		return fmt.Errorf("cannot find service %q in plan", request.Name)
-	}
-
-	var workload *workloads.Workload
-	if config.Workload != "" {
-		ws := currentPlan.Sections[workloads.WorkloadsField].(*workloads.WorkloadsSection)
-		if workload = ws.Entries[config.Workload]; workload == nil {
-			return fmt.Errorf("internal error: cannot find workload %q for service %q in plan", config.Workload, request.Name)
-		}
-	}
-
-	// Create the service object (or reuse the existing one by name).
-	service, taskLog := m.serviceForStart(config, workload)
-	if taskLog != "" {
-		addTaskLog(task, taskLog)
-	}
-	if service == nil {
-		return nil
-	}
-
-	m.state.Lock()
-	task.Set("started", true)
-	m.state.Unlock()
-
-	// Start the service and transition to stateStarting.
-	err = service.start()
-	if err != nil {
-		return err
-	}
-
-	// Wait for a small amount of time, and if the service hasn't exited,
-	// consider it a success.
-	select {
-	case err := <-service.started:
-		if err != nil {
-			addLastLogs(task, service.logs)
-			// Do not remove the service so that Pebble will restart it if the action is restart,
-			// and the logs are still accessible for failed services if the action is ignore.
-			return fmt.Errorf("service start attempt: %w", err)
-		}
-		// Started successfully (ran for small amount of time without exiting).
-		// Create a run-service change with a monitor task for lifecycle visibility.
-		m.state.Lock()
-		changeID := createMonitorOnlyRunServiceChange(m.state, request.Name, config)
-		m.state.EnsureBefore(0)
-		m.state.Unlock()
-
-		m.servicesLock.Lock()
-		service.runChangeID = changeID
-		m.servicesLock.Unlock()
-
-		// Trigger the runner to pick up the new change
-		m.runner.Ensure()
-
-		logger.Debugf("Created run-service change %s for service %q", changeID, request.Name)
-		return nil
-	case <-tomb.Dying():
-		// User tried to abort the start, sending SIGKILL to process is about
-		// the best we can do.
-		m.servicesLock.Lock()
-		defer m.servicesLock.Unlock()
-		service.transition(stateStopped)
-		err := syscall.Kill(-service.cmd.Process.Pid, syscall.SIGKILL)
-		if err != nil {
-			return fmt.Errorf("start aborted, but cannot send SIGKILL to process: %v", err)
-		}
-		return fmt.Errorf("start aborted, sent SIGKILL to process")
-	}
-}
-
 // serviceForStart looks up the service by name in the services map; it
 // creates a new service object if one doesn't exist, returns the existing one
 // if it already exists but is stopped, or returns nil if it already exists
@@ -1083,11 +993,11 @@ func (m *ServiceManager) doMonitorService(task *state.Task, tomb *tomb.Tomb) err
 	}
 }
 
-// doStartService starts a service. This is similar to doStart but designed
-// to work with the run-service change model.
+// doStartService starts a service and creates a run-service change for
+// lifecycle tracking after successful start.
 func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error {
 	m.state.Lock()
-	var details startServiceDetails
+	var details StartServiceDetails
 	err := task.Get("start-details", &details)
 	m.state.Unlock()
 	if err != nil {
@@ -1117,17 +1027,6 @@ func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error
 		return nil
 	}
 
-	// Cache the service config for use by handleRunServiceComplete
-	m.state.Lock()
-	changeID := task.Change().ID()
-	m.state.Cache(runServiceConfigKey{changeID}, config)
-	m.state.Unlock()
-
-	// Store the run-service change ID in the service
-	m.servicesLock.Lock()
-	service.runChangeID = changeID
-	m.servicesLock.Unlock()
-
 	// Start the service and transition to stateStarting
 	err = service.start()
 	if err != nil {
@@ -1142,7 +1041,21 @@ func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error
 			addLastLogs(task, service.logs)
 			return fmt.Errorf("service start attempt: %w", err)
 		}
-		// Started successfully
+		// Started successfully. Create a run-service change with a monitor
+		// task for lifecycle visibility.
+		m.state.Lock()
+		changeID := createMonitorOnlyRunServiceChange(m.state, details.ServiceName, config)
+		m.state.EnsureBefore(0)
+		m.state.Unlock()
+
+		m.servicesLock.Lock()
+		service.runChangeID = changeID
+		m.servicesLock.Unlock()
+
+		// Trigger the runner to pick up the new change
+		m.runner.Ensure()
+
+		logger.Debugf("Created run-service change %s for service %q", changeID, details.ServiceName)
 		return nil
 	case <-tomb.Dying():
 		// Task aborted
@@ -1157,10 +1070,10 @@ func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error
 	}
 }
 
-// doAutostartWait is a no-op handler for the autostart-wait task.
+// doStartWait is a no-op handler for the start-wait task.
 // This task waits for all start-service tasks to complete, allowing
-// the autostart change to complete when services have started.
-func (m *ServiceManager) doAutostartWait(task *state.Task, tomb *tomb.Tomb) error {
+// the wrapper change to complete when services have started.
+func (m *ServiceManager) doStartWait(task *state.Task, tomb *tomb.Tomb) error {
 	// This is a no-op; the task completes when its dependencies complete.
 	return nil
 }

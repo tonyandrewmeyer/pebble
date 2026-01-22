@@ -60,15 +60,11 @@ func NewManager(s *state.State, runner *state.TaskRunner, serviceOutput io.Write
 		logMgr:        logMgr,
 	}
 
-	// Old-style handlers (still needed for backward compatibility)
-	runner.AddHandler("start", manager.doStart, nil)
 	runner.AddHandler("stop", manager.doStop, nil)
-
-	// New change-based handlers
 	runner.AddHandler(startServiceKind, manager.doStartService, nil)
 	runner.AddHandler(monitorServiceKind, manager.doMonitorService, nil)
 	runner.AddHandler(restartServiceKind, manager.doRestartService, nil)
-	runner.AddHandler("autostart-wait", manager.doAutostartWait, nil)
+	runner.AddHandler("start-wait", manager.doStartWait, nil)
 
 	// Register change status change callback
 	s.Lock()
