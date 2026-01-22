@@ -1157,6 +1157,14 @@ func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error
 	}
 }
 
+// doAutostartWait is a no-op handler for the autostart-wait task.
+// This task waits for all start-service tasks to complete, allowing
+// the autostart change to complete when services have started.
+func (m *ServiceManager) doAutostartWait(task *state.Task, tomb *tomb.Tomb) error {
+	// This is a no-op; the task completes when its dependencies complete.
+	return nil
+}
+
 // doRestartService handles restarting a service with exponential backoff.
 // It will keep attempting to restart the service until it successfully runs.
 func (m *ServiceManager) doRestartService(task *state.Task, tomb *tomb.Tomb) error {

@@ -199,10 +199,22 @@ func (s *apiSuite) TestServicesAutoStart(c *C) {
 
 	c.Check(chg.Kind(), Equals, "autostart")
 
+	// The autostart change has a single wait task that depends on the
+	// start-service tasks in the run-service changes.
 	tasks := chg.Tasks()
-	c.Assert(tasks, HasLen, 2)
-	c.Assert(tasks[0].Summary(), Equals, `Start service "test1"`)
-	c.Assert(tasks[1].Summary(), Equals, `Start service "test2"`)
+	c.Assert(tasks, HasLen, 1)
+	c.Assert(tasks[0].Kind(), Equals, "autostart-wait")
+	c.Assert(tasks[0].Summary(), Equals, "Wait for services to start")
+
+	// Verify that run-service changes were created for the services.
+	// test1 has startup: enabled, and test2 is a dependency.
+	var runServiceChanges []*state.Change
+	for _, change := range st.Changes() {
+		if change.Kind() == "run-service" {
+			runServiceChanges = append(runServiceChanges, change)
+		}
+	}
+	c.Assert(runServiceChanges, HasLen, 2)
 }
 
 func (s *apiSuite) TestServicesGet(c *C) {

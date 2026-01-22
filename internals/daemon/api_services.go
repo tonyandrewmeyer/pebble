@@ -107,7 +107,34 @@ func v1PostServices(c *Command, r *http.Request, _ *UserState) Response {
 	var lanes [][]string
 	var services []string
 	switch payload.Action {
-	case "start", "autostart":
+	case "autostart":
+		// For autostart, use run-service changes for full lifecycle visibility.
+		// Each service gets its own long-running run-service change.
+		lanes, err = servmgr.StartOrder(payload.Services)
+		if err != nil {
+			break
+		}
+		plan := c.d.overlord.PlanManager().Plan()
+		var changeIDs []string
+		changeIDs, err = servstate.StartServices(st, plan, lanes)
+		if err != nil {
+			break
+		}
+		// Create a "wait" task for the wrapper change that waits for all
+		// start-service tasks in the run-service changes to complete.
+		// This allows the caller to wait for services to start without
+		// waiting for them to exit.
+		waitTask := st.NewTask("autostart-wait", "Wait for services to start")
+		for _, changeID := range changeIDs {
+			change := st.Change(changeID)
+			for _, task := range change.Tasks() {
+				if task.Kind() == "start-service" {
+					waitTask.WaitFor(task)
+				}
+			}
+		}
+		taskSet = state.NewTaskSet(waitTask)
+	case "start":
 		lanes, err = servmgr.StartOrder(payload.Services)
 		if err != nil {
 			break

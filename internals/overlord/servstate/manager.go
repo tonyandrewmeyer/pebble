@@ -68,6 +68,7 @@ func NewManager(s *state.State, runner *state.TaskRunner, serviceOutput io.Write
 	runner.AddHandler(startServiceKind, manager.doStartService, nil)
 	runner.AddHandler(monitorServiceKind, manager.doMonitorService, nil)
 	runner.AddHandler(restartServiceKind, manager.doRestartService, nil)
+	runner.AddHandler("autostart-wait", manager.doAutostartWait, nil)
 
 	// Register change status change callback
 	s.Lock()
