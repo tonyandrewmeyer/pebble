@@ -106,10 +106,11 @@ type restartServiceConfigKey struct {
 	changeID string
 }
 
-// createMonitorOnlyRunServiceChange creates a run-service change with just a monitor task.
-// This is used when the service has already been started via the old "start" task flow,
-// and we just need to monitor it for lifecycle visibility.
-func createMonitorOnlyRunServiceChange(st *state.State, serviceName string, config *plan.Service) (changeID string) {
+// createRunServiceChange creates a run-service change with a monitor task.
+// This is called after the service has been started (either by doStartService or
+// doRestartService) to provide lifecycle visibility - the change stays in "Doing"
+// status while the service runs and moves to "Done" or "Error" when it exits.
+func createRunServiceChange(st *state.State, serviceName string, config *plan.Service) (changeID string) {
 	summary := fmt.Sprintf("Run service %q", serviceName)
 
 	// Create monitor-service task (service is already running)

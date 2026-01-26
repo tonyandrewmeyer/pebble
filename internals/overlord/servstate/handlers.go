@@ -1044,7 +1044,7 @@ func (m *ServiceManager) doStartService(task *state.Task, tomb *tomb.Tomb) error
 		// Started successfully. Create a run-service change with a monitor
 		// task for lifecycle visibility.
 		m.state.Lock()
-		changeID := createMonitorOnlyRunServiceChange(m.state, details.ServiceName, config)
+		changeID := createRunServiceChange(m.state, details.ServiceName, config)
 		m.state.EnsureBefore(0)
 		m.state.Unlock()
 

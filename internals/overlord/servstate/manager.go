@@ -685,7 +685,7 @@ func (m *ServiceManager) handleRestartServiceComplete(change *state.Change) {
 	logger.Noticef("Service %q restarted successfully, creating new run-service change", serviceName)
 
 	// Use monitor-only change since the service is already running
-	changeID := createMonitorOnlyRunServiceChange(m.state, serviceName, config)
+	changeID := createRunServiceChange(m.state, serviceName, config)
 	m.state.EnsureBefore(0)
 	m.state.Unlock()
 
