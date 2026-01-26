@@ -107,7 +107,7 @@ func v1PostServices(c *Command, r *http.Request, _ *UserState) Response {
 	var lanes [][]string
 	var services []string
 	switch payload.Action {
-	case "autostart", "start":
+	case "start", "autostart":
 		// Each service gets a run-service change created after successful
 		// start for lifecycle visibility and restart handling.
 		lanes, err = servmgr.StartOrder(payload.Services)
