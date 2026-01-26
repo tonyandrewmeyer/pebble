@@ -75,10 +75,79 @@ func NewManager(s *state.State, runner *state.TaskRunner, serviceOutput io.Write
 }
 
 // PlanChanged informs the service manager that the plan has been updated.
-func (m *ServiceManager) PlanChanged(plan *plan.Plan) {
+// It automatically starts any new services with startup: enabled.
+func (m *ServiceManager) PlanChanged(newPlan *plan.Plan) {
 	m.planLock.Lock()
-	defer m.planLock.Unlock()
-	m.plan = plan
+	oldPlan := m.plan
+	m.plan = newPlan
+	m.planLock.Unlock()
+
+	// If this is the initial plan load (oldPlan is nil), don't auto-start
+	// services here - that's handled by the autostart API call on daemon startup.
+	if oldPlan == nil {
+		return
+	}
+
+	// Find new services with startup: enabled that weren't in the old plan
+	// or didn't have startup: enabled before.
+	var toStart []string
+	for name, config := range newPlan.Services {
+		if config.Startup != plan.StartupEnabled {
+			continue
+		}
+		// Check if this service is new or changed to startup: enabled
+		oldConfig, existed := oldPlan.Services[name]
+		if !existed || oldConfig.Startup != plan.StartupEnabled {
+			toStart = append(toStart, name)
+		}
+	}
+
+	if len(toStart) == 0 {
+		return
+	}
+
+	// Get the start order for the new services
+	startLanes, err := newPlan.StartOrder(toStart)
+	if err != nil {
+		logger.Noticef("Cannot determine start order for new services: %v", err)
+		return
+	}
+
+	// Create start tasks for the new services
+	m.state.Lock()
+	defer m.state.Unlock()
+
+	var tasks []*state.Task
+	for _, services := range startLanes {
+		lane := m.state.NewLane()
+		for i, name := range services {
+			task := m.state.NewTask(startServiceKind, fmt.Sprintf("Start service %q", name))
+			task.Set("start-details", &StartServiceDetails{
+				ServiceName: name,
+			})
+			task.JoinLane(lane)
+			if i > 0 {
+				task.WaitFor(tasks[len(tasks)-1])
+			}
+			tasks = append(tasks, task)
+		}
+	}
+
+	if len(tasks) == 0 {
+		return
+	}
+
+	taskSet := state.NewTaskSet(tasks...)
+	var names []string
+	for _, lane := range startLanes {
+		names = append(names, lane...)
+	}
+	summary := fmt.Sprintf("Autostart service %s", quotedNames(names))
+	change := m.state.NewChange("autostart", summary)
+	change.AddAll(taskSet)
+	m.state.EnsureBefore(0)
+
+	logger.Noticef("Auto-starting new services with startup: enabled: %v", names)
 }
 
 // getPlan returns the current plan pointer in a concurrency-safe way. The
@@ -628,4 +697,13 @@ func (m *ServiceManager) handleRestartServiceComplete(change *state.Change) {
 	m.servicesLock.Unlock()
 
 	m.runner.Ensure()
+}
+
+// quotedNames returns a string with quoted service names joined by commas.
+func quotedNames(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return strings.Join(quoted, ", ")
 }
