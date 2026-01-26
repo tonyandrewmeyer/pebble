@@ -259,7 +259,7 @@ func createStartTaskSet(st *state.State, lanes [][]string, waitFor *state.TaskSe
 			})
 			task.JoinLane(lane)
 
-			// Wait for prerequisite tasks (e.g., stop tasks in restart)
+			// Wait for prerequisite tasks (for example, stop tasks in restart)
 			if waitFor != nil {
 				for _, waitTask := range waitFor.Tasks() {
 					task.WaitFor(waitTask)
