@@ -119,6 +119,17 @@ func (m *LogManager) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Close service log buffers so that each gatherer's puller iterators
+	// drain and exit promptly. The state engine stops the LogManager before
+	// the service manager, so services are still running and writing to
+	// their buffers; without closing the buffers here, pullers stay blocked
+	// in iterator.Next() until the gatherer's force-kill timer fires (2s
+	// per gatherer). Subsequent writes to a closed buffer are dropped,
+	// which is fine during shutdown. See issue #681.
+	for _, buffer := range m.buffers {
+		_ = buffer.Close()
+	}
+
 	wg := sync.WaitGroup{}
 	for _, gatherer := range m.gatherers {
 		wg.Add(1)

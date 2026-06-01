@@ -180,6 +180,51 @@ func (s *managerSuite) TestTimelyShutdown(c *C) {
 	}
 }
 
+// TestTimelyShutdownWhileServicesRunning exercises the real shutdown ordering,
+// where LogManager.Stop is called before services have exited (and so their
+// ring buffers are still open). The pullers are blocked in iterator.Next()
+// waiting for data, so without LogManager.Stop closing the buffers itself,
+// they only exit when the gatherer's timeoutPullers timer force-kills them.
+// See https://github.com/canonical/pebble/issues/681.
+func (s *managerSuite) TestTimelyShutdownWhileServicesRunning(c *C) {
+	gathererOptions := logGathererOptions{
+		timeoutCurrentFlush: 5 * time.Millisecond,
+		timeoutFinalFlush:   5 * time.Millisecond,
+		newClient: func(_ *plan.LogTarget) (logClient, error) {
+			return &testClient{bufferSize: 5}, nil
+		},
+	}
+
+	m := NewLogManager()
+	m.newGatherer = func(t *plan.LogTarget) (*logGatherer, error) {
+		return newLogGathererInternal(t, &gathererOptions)
+	}
+
+	svc1 := newTestService("svc1")
+	m.PlanChanged(&plan.Plan{
+		Services: map[string]*plan.Service{
+			"svc1": svc1.config,
+		},
+		LogTargets: map[string]*plan.LogTarget{
+			"tgt1": {Name: "tgt1", Services: []string{"all"}},
+		},
+	})
+	m.ServiceStarted(svc1.config, svc1.ringBuffer)
+
+	// Deliberately do NOT close svc1's ring buffer: the service is still
+	// running when LogManager.Stop is called during shutdown.
+	done := make(chan struct{})
+	go func() {
+		m.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		c.Fatal("LogManager.Stop() took too long while services were still running")
+	}
+}
+
 type slowFlushingClient struct {
 	flushTime time.Duration
 	mu        sync.Mutex
