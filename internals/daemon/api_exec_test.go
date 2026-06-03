@@ -416,6 +416,34 @@ func (w channelWriter) Write(buf []byte) (int, error) {
 	return len(buf), nil
 }
 
+// TestShutdownWhileExecRunning is a smoke test for #682: an exec command in
+// flight holds hijacked websocket connections; Daemon.Stop must complete
+// well within shutdownTimeout (1s). The OnShutdown hook registered in
+// Start() kills exec tasks alongside http.Server.Shutdown so the poll
+// loop doesn't run out the clock if the hijacked-conn tracking ever
+// changes in Go or in our code.
+func (s *execSuite) TestShutdownWhileExecRunning(c *C) {
+	opts := &client.ExecOptions{
+		Command: []string{"yes"},
+		Stdin:   strings.NewReader(""),
+		Stdout:  io.Discard,
+		Stderr:  io.Discard,
+	}
+	_, err := s.client.Exec(opts)
+	c.Assert(err, IsNil)
+
+	// Give the exec a moment to actually start running and producing output.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	err = s.daemon.Stop(nil)
+	elapsed := time.Since(start)
+	c.Check(err, IsNil)
+	c.Logf("Stop took %s", elapsed)
+	c.Check(elapsed < 500*time.Millisecond, Equals, true,
+		Commentf("Stop took %s, want < 500ms", elapsed))
+}
+
 func (s *execSuite) TestNoCommand(c *C) {
 	httpResp, execResp := execRequest(c, &client.ExecOptions{})
 	c.Check(httpResp.StatusCode, Equals, http.StatusBadRequest)

@@ -543,8 +543,9 @@ func (ct *connTracker) CanStandby() bool {
 func (ct *connTracker) trackConn(conn net.Conn, state http.ConnState) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	// we ignore hijacked connections, if we do things with websockets
-	// we'll need custom shutdown handling for them
+	// We ignore hijacked connections here; the exec websocket case is handled
+	// via http.Server.RegisterOnShutdown above, which kills the underlying
+	// exec tasks so their connections close.
 	if state == http.StateNew || state == http.StateActive {
 		ct.conns[conn] = struct{}{}
 	} else {
@@ -604,6 +605,12 @@ func (d *Daemon) Start() error {
 		}),
 		ConnState: d.connTracker.trackConn,
 	}
+	// Kill any in-flight exec tasks when Shutdown is called: each exec holds a
+	// hijacked websocket connection that http.Server.Shutdown can't drain on its
+	// own, so without this it would poll until shutdownTimeout (1s) expires.
+	d.serve.RegisterOnShutdown(func() {
+		d.overlord.TaskRunner().StopKinds("exec")
+	})
 
 	d.initStandbyHandling()
 
