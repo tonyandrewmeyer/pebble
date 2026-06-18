@@ -237,3 +237,8 @@ jobs:
     needs: [release]
     if: github.event_name == 'release' && needs.release.result == 'success' && always()
     uses: ./.github/workflows/sbom-secscan.yaml
+    with:
+      # Scan the snap we just built and released, instead of re-downloading
+      # it from the store. Avoids publish-race flakiness and lets the FIPS
+      # branch reuse this workflow without a separate store channel.
+      snap-artifact: pebble-snap-amd64

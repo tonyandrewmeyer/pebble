@@ -2,6 +2,15 @@ name: SBOM and secscan
 
 on:
   workflow_call:
+    inputs:
+      snap-artifact:
+        description: >-
+          Name of a workflow-run artifact containing the locally built
+          pebble_*.snap to scan. If empty, sbomber falls back to downloading
+          the snap from the snap store via the channel in the manifest.
+        required: false
+        type: string
+        default: ''
   workflow_dispatch:
 
 permissions: {}
@@ -13,6 +22,30 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Download locally built snap
+        if: inputs.snap-artifact != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.snap-artifact }}
+          path: ./local-snap
+      - name: Point manifest at the local snap
+        if: inputs.snap-artifact != ''
+        env:
+          MANIFEST: .github/.sbomber-manifest-snap.yaml
+        run: |
+          set -euo pipefail
+          snap_file=$(ls ./local-snap/pebble_*.snap | head -n 1)
+          if [ -z "$snap_file" ]; then
+            echo "::error::no pebble_*.snap found in artifact '${{ inputs.snap-artifact }}'"
+            exit 1
+          fi
+          abs_path=$(realpath "$snap_file")
+          # Inject a `source:` line into the artifact so sbomber reads from the
+          # local file instead of `snap download`-ing from the store. The
+          # `name: 'pebble'` line above is unique in this manifest.
+          sed -i "/^  - name: 'pebble'$/a\\    source: '$abs_path'" "$MANIFEST"
+          echo "--- patched manifest ---"
+          cat "$MANIFEST"
       - name: sbomber
         uses: canonical/sbomber/.github/actions/run@cf7a76e810497ec932e8285b2c9d6b373d225e79  # main -- the sbomber-ref input below should match
         with:
