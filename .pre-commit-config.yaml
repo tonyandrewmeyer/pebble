@@ -1,0 +1,27 @@
+repos:
+  - repo: meta
+    hooks:
+      - id: check-hooks-apply
+      - id: check-useless-excludes
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -l -w
+        language: system
+        types: [go]
+        require_serial: true
+      - id: govet
+        name: go vet
+        entry: go vet ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+        require_serial: true
