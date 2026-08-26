@@ -19,10 +19,12 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"strings"
 	"testing"
 
 	. "gopkg.in/check.v1"
 
+	"github.com/canonical/pebble/internals/logger"
 	"github.com/canonical/pebble/internals/overlord/identities"
 	"github.com/canonical/pebble/internals/overlord/state"
 	"github.com/canonical/pebble/internals/testutil"
@@ -722,6 +724,130 @@ func (s *identitiesSuite) TestIdentityFromInputs(c *C) {
 			c.Assert(identity, IsNil)
 		}
 	}
+}
+
+func newManagerWithIdentities(c *C) (*identities.Manager, *state.State) {
+	st := state.New(nil)
+	mgr, err := identities.NewManager(st)
+	c.Assert(err, IsNil)
+
+	st.Lock()
+	defer st.Unlock()
+	err = mgr.AddIdentities(map[string]*identities.Identity{
+		"uid": {
+			Access: identities.MetricsAccess,
+			Local:  &identities.LocalIdentity{UserID: 42},
+		},
+		"basic": {
+			Access: identities.ReadAccess,
+			Basic: &identities.BasicIdentity{
+				// password: test
+				Password: "$6$F9cFSVEKyO4gB1Wh$8S1BSKsNkF.jBAixGc4W7l80OpfCNk65LZBDHBng3NAmbcHuMj4RIm7992rrJ8YA.SJ0hvm.vGk2z483am4Ym1",
+			},
+		},
+		"cert": {
+			Access: identities.AdminAccess,
+			Cert:   &identities.CertIdentity{X509: parseCert(c, validPEMX509Cert)},
+		},
+	})
+	c.Assert(err, IsNil)
+	return mgr, st
+}
+
+func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailCert(c *C) {
+	logBuf, restore := logger.MockLogger("")
+	defer restore()
+
+	mgr, st := newManagerWithIdentities(c)
+	st.Lock()
+	defer st.Unlock()
+
+	identity := mgr.IdentityFromInputs(nil, "", "", parseCert(c, invalidPEMX509Cert))
+	c.Assert(identity, IsNil)
+
+	ensureSecurityLog(c, logBuf.String(), "authn_login_fail:CN=example.com,O=Example Org",
+		"client certificate did not match any stored identity")
+}
+
+func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailBasic(c *C) {
+	logBuf, restore := logger.MockLogger("")
+	defer restore()
+
+	mgr, st := newManagerWithIdentities(c)
+	st.Lock()
+	defer st.Unlock()
+
+	identity := mgr.IdentityFromInputs(nil, "basic", "wrong", nil)
+	c.Assert(identity, IsNil)
+
+	ensureSecurityLog(c, logBuf.String(), "authn_login_fail:basic",
+		"basic auth credentials did not match any stored identity")
+}
+
+func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailUID(c *C) {
+	logBuf, restore := logger.MockLogger("")
+	defer restore()
+
+	mgr, st := newManagerWithIdentities(c)
+	st.Lock()
+	defer st.Unlock()
+
+	uid := new(uint32(100))
+	identity := mgr.IdentityFromInputs(uid, "", "", nil)
+	c.Assert(identity, IsNil)
+
+	ensureSecurityLog(c, logBuf.String(), "authn_login_fail:100",
+		"no stored identity for local UID")
+}
+
+func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailNoCredentials(c *C) {
+	logBuf, restore := logger.MockLogger("")
+	defer restore()
+
+	mgr, st := newManagerWithIdentities(c)
+	st.Lock()
+	defer st.Unlock()
+
+	identity := mgr.IdentityFromInputs(nil, "", "", nil)
+	c.Assert(identity, IsNil)
+
+	ensureSecurityLog(c, logBuf.String(), "authn_login_fail",
+		"no authentication credentials were provided")
+}
+
+// ensureSecurityLog checks that a WARN-level security log line matching the
+// given event and description was written to logs.
+func ensureSecurityLog(c *C, logs, event, description string) {
+	type securityLog struct {
+		Type        string `json:"type"`
+		Datetime    string `json:"datetime"`
+		Level       string `json:"level"`
+		Event       string `json:"event"`
+		Description string `json:"description"`
+		AppID       string `json:"appid"`
+	}
+
+	gotLog := false
+	for line := range strings.SplitSeq(logs, "\n") {
+		// Remove initial datetime prefix.
+		fields := strings.SplitN(line, " ", 2)
+		if len(fields) != 2 {
+			continue
+		}
+		var log securityLog
+		err := json.Unmarshal([]byte(fields[1]), &log)
+		if err != nil {
+			continue
+		}
+		if log.Type == "security" &&
+			log.Level == "WARN" &&
+			log.Event == event &&
+			log.Description == description &&
+			log.AppID == "pebble" {
+			gotLog = true
+		}
+	}
+	c.Check(gotLog, Equals, true, Commentf("security log not found: %s", logs))
 }
 
 func parseCert(c *C, pemBlock string) *x509.Certificate {

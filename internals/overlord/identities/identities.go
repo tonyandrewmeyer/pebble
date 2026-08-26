@@ -23,6 +23,7 @@ import (
 	"maps"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/GehirnInc/crypt/sha512_crypt"
@@ -370,6 +371,8 @@ func (m *Manager) IdentityFromInputs(userID *uint32, username, password string, 
 			}
 		}
 		// If a client certificate is provided, but did not match, we bail.
+		logger.SecurityWarn(logger.SecurityAuthnLoginFail, clientCert.Subject.String(),
+			"client certificate did not match any stored identity")
 		return nil
 
 	case username != "" || password != "":
@@ -387,6 +390,8 @@ func (m *Manager) IdentityFromInputs(userID *uint32, username, password string, 
 			break
 		}
 		// If basic auth credentials were provided, but did not match, we bail.
+		logger.SecurityWarn(logger.SecurityAuthnLoginFail, username,
+			"basic auth credentials did not match any stored identity")
 		return nil
 
 	case userID != nil:
@@ -396,9 +401,14 @@ func (m *Manager) IdentityFromInputs(userID *uint32, username, password string, 
 			}
 		}
 		// If UID was provided, but did not match, we bail.
+		logger.SecurityWarn(logger.SecurityAuthnLoginFail, strconv.Itoa(int(*userID)),
+			"no stored identity for local UID")
 		return nil
 	}
 
+	// No client certificate, basic auth credentials, or UID was provided
+	// at all, so there was nothing to authenticate against.
+	logger.SecurityWarn(logger.SecurityAuthnLoginFail, "", "no authentication credentials were provided")
 	return nil
 }
 

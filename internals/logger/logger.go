@@ -123,6 +123,7 @@ func securityEvent(level string, event SecurityEvent, arg, description string) {
 type SecurityEvent string
 
 const (
+	SecurityAuthnLoginFail     SecurityEvent = "authn_login_fail"
 	SecurityAuthzAdmin         SecurityEvent = "authz_admin"
 	SecurityAuthzFail          SecurityEvent = "authz_fail"
 	SecurityUserCreated        SecurityEvent = "user_created"
