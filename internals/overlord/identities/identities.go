@@ -23,7 +23,6 @@ import (
 	"maps"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/GehirnInc/crypt/sha512_crypt"
@@ -400,9 +399,12 @@ func (m *Manager) IdentityFromInputs(userID *uint32, username, password string, 
 				return identity
 			}
 		}
-		// If UID was provided, but did not match, we bail.
-		logger.SecurityWarn(logger.SecurityAuthnLoginFail, strconv.Itoa(int(*userID)),
-			"no stored identity for local UID")
+		// If UID was provided, but did not match, we bail. This is not
+		// logged as authn_login_fail: a peer credential that has no named
+		// identity is the ordinary fallback for local callers, not an
+		// attempted login, and named local identities are opt-in, so
+		// logging here would fire on every request from every local
+		// caller on a default install.
 		return nil
 	}
 

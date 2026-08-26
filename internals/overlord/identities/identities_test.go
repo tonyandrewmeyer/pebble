@@ -784,7 +784,10 @@ func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailBasic(c *C) {
 		"basic auth credentials did not match any stored identity")
 }
 
-func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailUID(c *C) {
+// An unmatched local UID is deliberately not logged: it is the ordinary
+// peer-credential fallback rather than an attempted login. See the comment
+// in IdentityFromInputs.
+func (s *identitiesSuite) TestSecurityLoggingUnmatchedUIDIsNotLogged(c *C) {
 	logBuf, restore := logger.MockLogger("")
 	defer restore()
 
@@ -792,12 +795,11 @@ func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailUID(c *C) {
 	st.Lock()
 	defer st.Unlock()
 
-	uid := new(uint32(100))
-	identity := mgr.IdentityFromInputs(uid, "", "", nil)
+	uid := uint32(100)
+	identity := mgr.IdentityFromInputs(&uid, "", "", nil)
 	c.Assert(identity, IsNil)
 
-	ensureSecurityLog(c, logBuf.String(), "authn_login_fail:100",
-		"no stored identity for local UID")
+	c.Assert(strings.Contains(logBuf.String(), "authn_login_fail"), Equals, false)
 }
 
 func (s *identitiesSuite) TestSecurityLoggingAuthnLoginFailNoCredentials(c *C) {
