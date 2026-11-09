@@ -32,3 +32,8 @@ jobs:
         with:
           sarif_file: results.sarif
           category: zizmor
+
+      - name: Fail on findings
+        run: uvx zizmor@v1.23.1 .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
