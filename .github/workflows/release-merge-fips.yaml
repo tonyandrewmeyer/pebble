@@ -64,7 +64,11 @@ jobs:
 
       - name: Resolve conflicts with opencode
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # Isolated job: read-only permissions plus this one secret. A dedicated
+          # environment doesn't interact well with secrets forwarded explicitly
+          # (rather than via `secrets: inherit`) to reusable workflows, so we
+          # rely on the narrow job permissions instead.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}  # zizmor: ignore[secrets-outside-env]
           PROMPT: |
             This repository checkout is in the middle of a git merge with
             conflicts: merging tag ${{ inputs.version }} into the fips
